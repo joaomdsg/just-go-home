@@ -4,6 +4,25 @@ A waybar widget for Hyprland (and any modern Wayland/waybar setup — built
 and tested on [Omarchy](https://omarchy.org)) that ends the workday for me,
 because I won't.
 
+The widget escalates top-to-bottom: calm → warm → warning → urgent →
+flashing → shutdown. Notifications follow the same arc:
+
+### Mako Notifications
+
+![calm](screenshots/notification-calm.png) ![urgent](screenshots/notification-urgent.png) ![shutdown](screenshots/notification-shutdown.png)
+
+### Waybar Widget (escalation)
+
+![widget-calm](screenshots/widget-calm.png)
+![widget-warm](screenshots/widget-warm.png)
+![widget-warning](screenshots/widget-warning.png)
+![widget-urgent](screenshots/widget-urgent.png)
+![widget-flashing](screenshots/widget-flashing.png)
+![widget-shutdown](screenshots/widget-shutdown.png)
+
+Regenerate (Hyprland + grim + slurp): `screenshots/capture.sh` for the bar,
+`screenshots/capture-notifications.sh` for the mako variants.
+
 ## Why
 
 Work expands. Family time doesn't. Without a forcing function, the day bleeds
