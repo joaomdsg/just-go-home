@@ -7,9 +7,12 @@ because I won't.
 The widget escalates top-to-bottom: calm → warm → warning → urgent →
 flashing → shutdown. Notifications follow the same arc:
 
-| Waybar widget (escalation) | Mako notifications |
-|---|---|
-| ![widget-calm](screenshots/widget-calm.png)<br>![widget-warm](screenshots/widget-warm.png)<br>![widget-warning](screenshots/widget-warning.png)<br>![widget-urgent](screenshots/widget-urgent.png)<br>![widget-flashing](screenshots/widget-flashing.png)<br>![widget-shutdown](screenshots/widget-shutdown.png) | ![notification-calm](screenshots/notification-calm.png)<br>![notification-urgent](screenshots/notification-urgent.png)<br>![notification-shutdown](screenshots/notification-shutdown.png) |
+![calm](screenshots/state-calm.png)
+![warm](screenshots/state-warm.png)
+![warning](screenshots/state-warning.png)
+![urgent](screenshots/state-urgent.png)
+![flashing](screenshots/state-flashing.png)
+![shutdown](screenshots/state-shutdown.png)
 
 ## Why
 
