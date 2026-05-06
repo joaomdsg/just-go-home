@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# Fire each notification variant the script actually uses (with the
-# colored progress bar) and capture each one via grim+slurp.
+# Fire each mako notification variant (calm, urgent, shutdown — the ones the
+# widget actually emits, complete with the colored progress bar) and grab
+# each with grim into ./screenshots/.
+#
+# Requires: grim, slurp, python3, just-go-home on $PATH, and a running mako
+# (or other notify-send-compatible daemon) to render the notifications.
+#
+# Imports just-go-home as a python module to call its notification helpers
+# directly, so this fires real notifications — close any leftovers with
+# `makoctl dismiss --all`.
 #
 # Usage: screenshots/capture-notifications.sh
 set -euo pipefail

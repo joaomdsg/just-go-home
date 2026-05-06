@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
-# Drive the widget through every visible state and capture PNGs into ./screenshots/.
-# Requires: grim, slurp, just-go-home installed.
+# Drive the waybar widget through every visible state (calm → warm → warning
+# → urgent → flashing → shutdown) and grab each with grim into ./screenshots/.
+#
+# Requires: grim, slurp, just-go-home on $PATH, a running waybar with the
+# widget. Hyprland or another wlroots compositor (grim/slurp need it).
 #
 # Usage:
-#   screenshots/capture.sh                 # interactive: slurp prompts for the region
-#   screenshots/capture.sh 32,352 600x26   # explicit "x,y WxH" (slurp format)
+#   screenshots/capture-widget.sh                 # slurp prompts for the region
+#   screenshots/capture-widget.sh 32,352 600x26   # explicit "x,y WxH" (slurp format)
 #
-# Notes:
-#  - Backs up state.json and restores on exit (even on Ctrl-C).
-#  - Uses preview-mode + skip_final_notif so no real shutdown / final
-#    notification fires.
+# Implementation notes:
+#  - Writes state.json under the same state.lock flock the widget's tick uses,
+#    via tempfile + atomic mv. A bare `>` redirect races with tick's atomic
+#    rename and the widget never sees the override.
+#  - Emits naive ISO timestamps (no tz suffix). The widget stores naive
+#    datetimes; a tz-aware override raises TypeError in get_target and the
+#    widget silently falls into the error path.
+#  - Sets preview=true + skip_final_notif=true so no real shutdown fires and
+#    no final notification sneaks through during the past-target capture.
+#  - Backs up state.json and restores it on exit (even on Ctrl-C).
 set -euo pipefail
 cd "$(dirname "$0")"
 

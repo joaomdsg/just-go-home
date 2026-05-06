@@ -11,9 +11,6 @@ flashing → shutdown. Notifications follow the same arc:
 |---|---|
 | ![widget-calm](screenshots/widget-calm.png)<br>![widget-warm](screenshots/widget-warm.png)<br>![widget-warning](screenshots/widget-warning.png)<br>![widget-urgent](screenshots/widget-urgent.png)<br>![widget-flashing](screenshots/widget-flashing.png)<br>![widget-shutdown](screenshots/widget-shutdown.png) | ![notification-calm](screenshots/notification-calm.png)<br>![notification-urgent](screenshots/notification-urgent.png)<br>![notification-shutdown](screenshots/notification-shutdown.png) |
 
-Regenerate (Hyprland + grim + slurp): `screenshots/capture.sh` for the bar,
-`screenshots/capture-notifications.sh` for the mako variants.
-
 ## Why
 
 Work expands. Family time doesn't. Without a forcing function, the day bleeds
