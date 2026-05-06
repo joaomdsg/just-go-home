@@ -7,11 +7,6 @@ because I won't.
 The widget escalates top-to-bottom: calm → warm → warning → urgent →
 flashing → shutdown. Notifications follow the same arc:
 
-### Mako Notifications
-
-| ![calm](screenshots/notification-calm.png) | ![urgent](screenshots/notification-urgent.png) | ![shutdown](screenshots/notification-shutdown.png) |
-|---|---|---|
-
 ### Waybar Widget (escalation)
 
 ![widget-calm](screenshots/widget-calm.png)
@@ -20,6 +15,11 @@ flashing → shutdown. Notifications follow the same arc:
 ![widget-urgent](screenshots/widget-urgent.png)
 ![widget-flashing](screenshots/widget-flashing.png)
 ![widget-shutdown](screenshots/widget-shutdown.png)
+
+### Mako Notifications
+
+| ![calm](screenshots/notification-calm.png) | ![urgent](screenshots/notification-urgent.png) | ![shutdown](screenshots/notification-shutdown.png) |
+|---|---|---|
 
 Regenerate (Hyprland + grim + slurp): `screenshots/capture.sh` for the bar,
 `screenshots/capture-notifications.sh` for the mako variants.
