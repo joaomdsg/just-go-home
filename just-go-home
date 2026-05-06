@@ -281,10 +281,21 @@ def fmt_remaining(secs):
 
 
 BAR_COLORS = [
-    "#d4e157", "#dde260", "#e6e466", "#efe568",
-    "#f5db5a", "#fac84f", "#ffb348", "#ff9b3d",
-    "#ff8333", "#ff6b2d", "#fb541f", "#f6411a",
-    "#ef2918", "#e60d10", "#ff0000",
+    "#d4e157",
+    "#dde260",
+    "#e6e466",
+    "#efe568",
+    "#f5db5a",
+    "#fac84f",
+    "#ffb348",
+    "#ff9b3d",
+    "#ff8333",
+    "#ff6b2d",
+    "#fb541f",
+    "#f6411a",
+    "#ef2918",
+    "#e60d10",
+    "#ff0000",
 ]
 URGENT_THRESHOLDS = [60, 30, 0]
 MAIN_LEN = len(BAR_COLORS) - len(URGENT_THRESHOLDS)
@@ -373,7 +384,7 @@ def fire_notification(secs, config, state=None):
     available = [m for m in pool if m not in recent] or pool
     msg = random.choice(available)
     if state is not None:
-        state["recent_msgs"] = (recent + [msg])[-max(1, len(pool) // 2):]
+        state["recent_msgs"] = (recent + [msg])[-max(1, len(pool) // 2) :]
     n, unit = fmt_remaining(secs)
     body = build_body(shutdown_line(f"<b>{n}</b>", unit), secs)
     urgency = "critical" if secs <= 60 else "normal"
@@ -407,10 +418,7 @@ def maybe_notify(eta, state, now, config):
 
 
 def fire_final_notification(state):
-    top = (
-        f"<span font='Monospace 8'><b>Shutting down</b>"
-        f"<span weight='ultralight'> NOW!</span></span>"
-    )
+    top = "<span font='Monospace 8'>Shutting down <b>NOW!</b></span>"
     send_notification(
         state,
         "critical",
@@ -588,13 +596,24 @@ def cmd_postpone():
     if target is None:
         sys.exit("no active target to postpone")
     raw_phrases = config.get("phrases", [])
-    phrases = [p for p in raw_phrases if isinstance(p, str) and p.strip()] if isinstance(raw_phrases, list) else []
+    phrases = (
+        [p for p in raw_phrases if isinstance(p, str) and p.strip()]
+        if isinstance(raw_phrases, list)
+        else []
+    )
     if not phrases:
         safe_run(
-            ["notify-send", "-u", "critical", "-a", "just-go-home",
-             "-i", "alarm-symbolic",
-             "No override phrases configured",
-             "Add a <tt>phrases</tt> array to <tt>config.toml</tt> to enable postpone."],
+            [
+                "notify-send",
+                "-u",
+                "critical",
+                "-a",
+                "just-go-home",
+                "-i",
+                "alarm-symbolic",
+                "No override phrases configured",
+                "Add a <tt>phrases</tt> array to <tt>config.toml</tt> to enable postpone.",
+            ],
         )
         sys.exit("no phrases configured — refusing override")
 
@@ -728,8 +747,9 @@ def _play_postpone_phrase(phrase, minutes):
                 parts.append(f"{DIM}{'·' * len(w)}{RESET}")
         progress = f"{cur_idx}/{total_words}"
         return (
-            f"\r\x1b[2K{offset}      " + "  ".join(parts) +
-            f"\r\n\x1b[2K\r\n\x1b[2K      {DIM}word {progress} · errors {errors}{RESET}"
+            f"\r\x1b[2K{offset}      "
+            + "  ".join(parts)
+            + f"\r\n\x1b[2K\r\n\x1b[2K      {DIM}word {progress} · errors {errors}{RESET}"
         )
 
     sys.stdout.write(SHOW_CURSOR)
@@ -741,6 +761,7 @@ def _play_postpone_phrase(phrase, minutes):
         f" — esc to cancel{RESET}\n\n\n"
     )
     sys.stdout.flush()
+
     def cursor_col(pos):
         col = 6
         words_done = phrase[:pos].count(" ")

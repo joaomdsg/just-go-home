@@ -7,19 +7,9 @@ because I won't.
 The widget escalates top-to-bottom: calm → warm → warning → urgent →
 flashing → shutdown. Notifications follow the same arc:
 
-### Waybar Widget (escalation)
-
-![widget-calm](screenshots/widget-calm.png)
-![widget-warm](screenshots/widget-warm.png)
-![widget-warning](screenshots/widget-warning.png)
-![widget-urgent](screenshots/widget-urgent.png)
-![widget-flashing](screenshots/widget-flashing.png)
-![widget-shutdown](screenshots/widget-shutdown.png)
-
-### Mako Notifications
-
-| ![calm](screenshots/notification-calm.png) | ![urgent](screenshots/notification-urgent.png) | ![shutdown](screenshots/notification-shutdown.png) |
-|---|---|---|
+| Waybar widget (escalation) | Mako notifications |
+|---|---|
+| ![widget-calm](screenshots/widget-calm.png)<br>![widget-warm](screenshots/widget-warm.png)<br>![widget-warning](screenshots/widget-warning.png)<br>![widget-urgent](screenshots/widget-urgent.png)<br>![widget-flashing](screenshots/widget-flashing.png)<br>![widget-shutdown](screenshots/widget-shutdown.png) | ![notification-calm](screenshots/notification-calm.png)<br>![notification-urgent](screenshots/notification-urgent.png)<br>![notification-shutdown](screenshots/notification-shutdown.png) |
 
 Regenerate (Hyprland + grim + slurp): `screenshots/capture.sh` for the bar,
 `screenshots/capture-notifications.sh` for the mako variants.
