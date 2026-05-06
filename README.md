@@ -1,6 +1,8 @@
 # just-go-home
 
-A status bar widget that ends the workday for me, because I won't.
+A waybar widget for Hyprland (and any modern Wayland/waybar setup — built
+and tested on [Omarchy](https://omarchy.org)) that ends the workday for me,
+because I won't.
 
 ## Why
 
@@ -57,8 +59,10 @@ evening is mine. That is the whole point.
   daemon supporting `synchronous` hints — replaces previous notification)
 - `systemd` — `systemctl poweroff` is the shutdown mechanism
 - For the click-to-postpone flow: a terminal reachable via
-  `xdg-terminal-exec` and `uwsm-app` (Omarchy/Hyprland defaults). Adjust the
-  `on-click` line in your waybar config if your setup differs.
+  `xdg-terminal-exec` and `uwsm-app` (Hyprland-with-uwsm setups, including
+  Omarchy, get this for free). Adjust the `on-click` line in your waybar
+  config if your setup differs — any terminal that runs
+  `just-go-home postpone` works.
 
 ## Install
 
