@@ -523,7 +523,7 @@ def _emit_tick():
                 print(
                     json.dumps(
                         {
-                            "text": "SHUTTING DOWN NOW!",
+                            "text": "<span weight='heavy' size='medium'>SHUTTING DOWN NOW!</span>",
                             "class": "shutdown",
                             "tooltip": "shutting down",
                         }
