@@ -7,11 +7,22 @@ because I won't.
 The widget escalates top-to-bottom: calm → warm → warning → urgent →
 flashing → shutdown. Notifications follow the same arc:
 
+### calm — hours out
 ![calm](screenshots/state-calm.png)
+
+### warm — first reminder, 1 hour
 ![warm](screenshots/state-warm.png)
+
+### warning — 15 minutes
 ![warning](screenshots/state-warning.png)
+
+### urgent — 5 minutes
 ![urgent](screenshots/state-urgent.png)
+
+### flashing — 30 seconds
 ![flashing](screenshots/state-flashing.png)
+
+### shutdown — TIME IS UP
 ![shutdown](screenshots/state-shutdown.png)
 
 ## Why
