@@ -2,6 +2,9 @@
 """just-go-home — end-of-workday enforcer for Omarchy/waybar."""
 
 import argparse
+import contextlib
+import errno
+import fcntl
 import json
 import os
 import random
@@ -24,6 +27,7 @@ CACHE_DIR = (
     Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "just-go-home"
 )
 STATE_FILE = CACHE_DIR / "state.json"
+LOCK_FILE = CACHE_DIR / "state.lock"
 
 DAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 NOTIFY_OFFSETS = [3600, 1800, 900, 300, 60, 30]
@@ -31,11 +35,60 @@ POSTPONE_LOCK_SECS = 90
 DRY_RUN = os.environ.get("JGH_DRY_RUN") == "1"
 
 
-def load_config():
-    if not CONFIG_FILE.exists():
+def safe_run(cmd, **kwargs):
+    """subprocess.run that returns None if the binary is missing or any OSError occurs."""
+    kwargs.setdefault("check", False)
+    try:
+        return subprocess.run(cmd, **kwargs)
+    except (FileNotFoundError, PermissionError, OSError):
         return None
-    with open(CONFIG_FILE, "rb") as f:
-        return tomllib.load(f)
+
+
+@contextlib.contextmanager
+def state_lock():
+    """Cross-process advisory lock around state.json read-modify-write.
+
+    Why: tick runs every 1s; postpone runs interactively. Without locking,
+    postpone's `postpone_lock_until` can be clobbered by an interleaved tick.
+    """
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        yield
+        return
+    try:
+        f = open(LOCK_FILE, "w")
+    except OSError:
+        yield
+        return
+    try:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            pass
+        yield
+    finally:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        f.close()
+
+
+def load_config():
+    """Returns (config_dict, error_message). Both None if file is absent."""
+    if not CONFIG_FILE.exists():
+        return None, None
+    try:
+        with open(CONFIG_FILE, "rb") as f:
+            cfg = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        return None, f"config: invalid TOML — {e}"
+    except OSError as e:
+        return None, f"config: {e}"
+    if not isinstance(cfg, dict):
+        return None, "config: top-level must be a table"
+    return cfg, None
 
 
 def load_state():
@@ -43,28 +96,69 @@ def load_state():
         return {}
     try:
         with open(STATE_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
     except (json.JSONDecodeError, OSError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
 
 
 def save_state(state):
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(f".json.{os.getpid()}.tmp")
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_FILE)
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        # Cache dir unwritable / disk full — widget keeps running with in-memory state.
+        pass
+
+
+def _parse_target_spec(spec):
+    """Returns (days_set, hour, minute) or None if the spec is malformed."""
+    if not isinstance(spec, dict):
+        return None
+    raw_days = spec.get("days")
+    raw_time = spec.get("time")
+    if not isinstance(raw_days, list) or not raw_days or not isinstance(raw_time, str):
+        return None
+    days = set()
+    for d in raw_days:
+        if not isinstance(d, str):
+            return None
+        idx = DAY_MAP.get(d.lower().strip())
+        if idx is None:
+            return None
+        days.add(idx)
+    parts = raw_time.split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        h = int(parts[0])
+        m = int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    return days, h, m
 
 
 def next_scheduled(config, now):
     candidates = []
-    for spec in config.get("targets", []):
-        days = [DAY_MAP[d.lower()] for d in spec["days"]]
-        h, m = map(int, spec["time"].split(":"))
+    for spec in config.get("targets", []) or []:
+        parsed = _parse_target_spec(spec)
+        if parsed is None:
+            continue
+        days, h, m = parsed
         for offset in range(0, 8):
             d = (now + timedelta(days=offset)).date()
             if d.weekday() in days:
-                cand = datetime.combine(d, time(h, m))
+                try:
+                    cand = datetime.combine(d, time(h, m))
+                except ValueError:
+                    break
                 if cand > now:
                     candidates.append(cand)
                     break
@@ -73,7 +167,7 @@ def next_scheduled(config, now):
 
 def get_target(config, state, now):
     override = state.get("target_override")
-    if override:
+    if isinstance(override, str):
         try:
             ov = datetime.fromisoformat(override)
             if ov > now or state.get("preview"):
@@ -81,6 +175,18 @@ def get_target(config, state, now):
         except ValueError:
             pass
     return next_scheduled(config, now)
+
+
+def _sanitize_fired(fired):
+    if not isinstance(fired, list):
+        return []
+    out = []
+    for v in fired:
+        try:
+            out.append(str(int(v)))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(out), key=int)
 
 
 def reconcile(state, target):
@@ -91,7 +197,7 @@ def reconcile(state, target):
         state["last_eta"] = None
         state["last_tick"] = None
         state["final_notif_at"] = None
-    state.setdefault("fired", [])
+    state["fired"] = _sanitize_fired(state.get("fired"))
     return state
 
 
@@ -235,26 +341,35 @@ def send_notification(state, urgency, timeout_ms, summary, body):
     ]
     if state is not None and state.get("notif_id"):
         prev = str(state["notif_id"])
-        subprocess.run(
+        safe_run(
             ["makoctl", "dismiss", "-n", prev],
-            check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         args += ["-r", prev]
     args += [summary, body]
-    res = subprocess.run(args, check=False, capture_output=True, text=True)
-    if state is not None:
+    res = safe_run(args, capture_output=True, text=True)
+    if state is not None and res is not None and res.stdout:
         nid = res.stdout.strip()
         if nid.isdigit():
             state["notif_id"] = int(nid)
 
 
+def _str_pool(value, default):
+    if not isinstance(value, list):
+        return default
+    cleaned = [m for m in value if isinstance(m, str) and m]
+    return cleaned or default
+
+
 def fire_notification(secs, config, state=None):
-    calm = config.get("notification_messages") or DEFAULT_CALM_MESSAGES
-    urgent = config.get("urgent_notification_messages") or DEFAULT_URGENT_MESSAGES
+    calm = _str_pool(config.get("notification_messages"), DEFAULT_CALM_MESSAGES)
+    urgent = _str_pool(
+        config.get("urgent_notification_messages"), DEFAULT_URGENT_MESSAGES
+    )
     pool = urgent if secs <= 60 else calm
-    recent = (state or {}).get("recent_msgs", [])
+    recent_raw = (state or {}).get("recent_msgs")
+    recent = recent_raw if isinstance(recent_raw, list) else []
     available = [m for m in pool if m not in recent] or pool
     msg = random.choice(available)
     if state is not None:
@@ -271,7 +386,7 @@ def maybe_notify(eta, state, now, config):
     state["last_tick"] = now.isoformat()
     state["last_eta"] = eta
     fresh = True
-    if last_tick is not None:
+    if isinstance(last_tick, str):
         try:
             fresh = (now - datetime.fromisoformat(last_tick)).total_seconds() > 5
         except ValueError:
@@ -279,7 +394,9 @@ def maybe_notify(eta, state, now, config):
     if fresh:
         state["fired"] = sorted([str(o) for o in NOTIFY_OFFSETS if eta <= o], key=int)
         return
-    fired = set(state.get("fired", []))
+    fired = set(_sanitize_fired(state.get("fired")))
+    if not isinstance(last_eta, (int, float)):
+        last_eta = None
     for o in NOTIFY_OFFSETS:
         if last_eta is not None and last_eta > o and eta <= o and str(o) not in fired:
             fired.add(str(o))
@@ -307,12 +424,12 @@ def trigger_shutdown():
     if DRY_RUN:
         sys.stderr.write("JGH_DRY_RUN: would run systemctl poweroff\n")
         return
-    subprocess.run(["systemctl", "poweroff"], check=False)
+    safe_run(["systemctl", "poweroff"])
 
 
 def in_postpone_window(state, now):
     until = state.get("postpone_lock_until")
-    if not until:
+    if not isinstance(until, str) or not until:
         return False
     try:
         return datetime.fromisoformat(until) > now
@@ -320,9 +437,24 @@ def in_postpone_window(state, now):
         return False
 
 
+def _emit_error_json(text, tooltip):
+    try:
+        print(
+            json.dumps({"text": text, "class": "error", "tooltip": tooltip}),
+            flush=True,
+        )
+    except (BrokenPipeError, OSError):
+        pass
+
+
 def cmd_tick(loop=False):
     if not loop:
-        _emit_tick()
+        try:
+            _emit_tick()
+        except Exception:
+            sys.stderr.write(traceback.format_exc())
+            sys.stderr.flush()
+            _emit_error_json("error", "see stderr / journalctl")
         return
     while True:
         try:
@@ -330,142 +462,187 @@ def cmd_tick(loop=False):
         except Exception:
             sys.stderr.write(traceback.format_exc())
             sys.stderr.flush()
-        _time.sleep(1)
+            _emit_error_json("error", "see stderr / journalctl")
+        try:
+            _time.sleep(1)
+        except (InterruptedError, KeyboardInterrupt):
+            return
 
 
 def _emit_tick():
-    config = load_config()
+    config, err = load_config()
+    if err is not None:
+        _emit_error_json("config error", err)
+        return
     if config is None:
-        print(
-            json.dumps(
-                {
-                    "text": "no config",
-                    "class": "error",
-                    "tooltip": "run: just-go-home init",
-                }
-            ),
-            flush=True,
-        )
+        _emit_error_json("no config", "run: just-go-home init")
         return
     now = datetime.now()
-    state = load_state()
-    target = get_target(config, state, now)
-    state = reconcile(state, target)
+    with state_lock():
+        state = load_state()
+        target = get_target(config, state, now)
+        state = reconcile(state, target)
 
-    if target is None:
-        save_state(state)
-        print(
-            json.dumps(
-                {
-                    "text": "—",
-                    "class": "idle",
-                    "tooltip": "no upcoming target",
-                }
-            ),
-            flush=True,
-        )
-        return
-
-    eta = int((target - now).total_seconds())
-
-    if eta <= 0:
-        if in_postpone_window(state, now):
+        if target is None:
             save_state(state)
+            try:
+                print(
+                    json.dumps(
+                        {
+                            "text": "—",
+                            "class": "idle",
+                            "tooltip": "no upcoming target",
+                        }
+                    ),
+                    flush=True,
+                )
+            except (BrokenPipeError, OSError):
+                pass
+            return
+
+        eta = int((target - now).total_seconds())
+
+        if eta <= 0:
+            if in_postpone_window(state, now):
+                save_state(state)
+                try:
+                    print(
+                        json.dumps(
+                            {
+                                "text": "PAUSED",
+                                "class": "paused",
+                                "tooltip": "override in progress",
+                            }
+                        ),
+                        flush=True,
+                    )
+                except (BrokenPipeError, OSError):
+                    pass
+                return
+            try:
+                print(
+                    json.dumps(
+                        {
+                            "text": "SHUTTING DOWN NOW!",
+                            "class": "shutdown",
+                            "tooltip": "shutting down",
+                        }
+                    ),
+                    flush=True,
+                )
+            except (BrokenPipeError, OSError):
+                pass
+            if not state.get("final_notif_at"):
+                state["final_notif_at"] = now.isoformat()
+                save_state(state)
+                if not state.get("skip_final_notif"):
+                    fire_final_notification(state)
+            save_state(state)
+            elapsed = 999
+            final_at = state.get("final_notif_at")
+            if isinstance(final_at, str):
+                try:
+                    elapsed = (now - datetime.fromisoformat(final_at)).total_seconds()
+                except ValueError:
+                    elapsed = 999
+            if elapsed >= 10 and not state.get("preview"):
+                trigger_shutdown()
+            return
+
+        cls = classify(eta)
+        try:
             print(
                 json.dumps(
                     {
-                        "text": "PAUSED",
-                        "class": "paused",
-                        "tooltip": "override in progress",
+                        "text": fmt_eta_pango(eta),
+                        "class": cls,
+                        "tooltip": f"target: {target.strftime('%a %H:%M')}",
                     }
-                )
+                ),
+                flush=True,
             )
-            return
-        print(
-            json.dumps(
-                {
-                    "text": "SHUTTING DOWN NOW!",
-                    "class": "shutdown",
-                    "tooltip": "shutting down",
-                }
-            ),
-            flush=True,
-        )
-        if not state.get("final_notif_at"):
-            state["final_notif_at"] = now.isoformat()
-            save_state(state)
-            if not state.get("skip_final_notif"):
-                fire_final_notification(state)
+        except (BrokenPipeError, OSError):
+            pass
+        maybe_notify(eta, state, now, config)
         save_state(state)
-        try:
-            elapsed = (
-                now - datetime.fromisoformat(state["final_notif_at"])
-            ).total_seconds()
-        except ValueError:
-            elapsed = 999
-        if elapsed >= 10 and not state.get("preview"):
-            trigger_shutdown()
-        return
 
-    cls = classify(eta)
-    print(
-        json.dumps(
-            {
-                "text": fmt_eta_pango(eta),
-                "class": cls,
-                "tooltip": f"target: {target.strftime('%a %H:%M')}",
-            }
-        ),
-        flush=True,
-    )
-    maybe_notify(eta, state, now, config)
-    save_state(state)
+
+def _coerce_minutes(value, default=15):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return n if n > 0 else default
 
 
 def cmd_postpone():
-    config = load_config()
+    config, err = load_config()
+    if err is not None:
+        sys.exit(err)
     if config is None:
         sys.exit("no config — run: just-go-home init")
-    state = load_state()
     now = datetime.now()
-    target = get_target(config, state, now)
+    with state_lock():
+        state = load_state()
+        target = get_target(config, state, now)
     if target is None:
         sys.exit("no active target to postpone")
-    phrases = config.get("phrases", [])
+    raw_phrases = config.get("phrases", [])
+    phrases = [p for p in raw_phrases if isinstance(p, str) and p.strip()] if isinstance(raw_phrases, list) else []
     if not phrases:
-        subprocess.run(
+        safe_run(
             ["notify-send", "-u", "critical", "-a", "just-go-home",
              "-i", "alarm-symbolic",
              "No override phrases configured",
              "Add a <tt>phrases</tt> array to <tt>config.toml</tt> to enable postpone."],
-            check=False,
         )
         sys.exit("no phrases configured — refusing override")
 
-    state["postpone_lock_until"] = (
-        now + timedelta(seconds=POSTPONE_LOCK_SECS)
-    ).isoformat()
-    save_state(state)
+    with state_lock():
+        state = load_state()
+        state["postpone_lock_until"] = (
+            now + timedelta(seconds=POSTPONE_LOCK_SECS)
+        ).isoformat()
+        save_state(state)
 
+    ok = False
     try:
         phrase = random.choice(phrases)
-        minutes = int(config.get("postpone_minutes", 15))
-        ok = _play_postpone_phrase(phrase, minutes)
+        minutes = _coerce_minutes(config.get("postpone_minutes", 15))
+        try:
+            ok = _play_postpone_phrase(phrase, minutes)
+        except (KeyboardInterrupt, EOFError):
+            ok = False
         if not ok:
-            print("\n  override cancelled. good.\n")
+            try:
+                print("\n  override cancelled. good.\n")
+            except (BrokenPipeError, OSError):
+                pass
             return
         new_target = target + timedelta(minutes=minutes)
-        state["target_override"] = new_target.isoformat()
-        state["target_key"] = new_target.isoformat()
-        state["fired"] = []
-        print(
-            f"\n  \x1b[32m✓\x1b[0m postponed by \x1b[1m{minutes}m\x1b[0m"
-            f" — new target \x1b[1m{new_target.strftime('%H:%M')}\x1b[0m\n"
-        )
-        _time.sleep(2)
+        try:
+            print(
+                f"\n  \x1b[32m✓\x1b[0m postponed by \x1b[1m{minutes}m\x1b[0m"
+                f" — new target \x1b[1m{new_target.strftime('%H:%M')}\x1b[0m\n"
+            )
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            _time.sleep(2)
+        except (InterruptedError, KeyboardInterrupt):
+            pass
     finally:
-        state["postpone_lock_until"] = None
-        save_state(state)
+        with state_lock():
+            state = load_state()
+            state["postpone_lock_until"] = None
+            if ok:
+                new_target = target + timedelta(
+                    minutes=_coerce_minutes(config.get("postpone_minutes", 15))
+                )
+                state["target_override"] = new_target.isoformat()
+                state["target_key"] = new_target.isoformat()
+                state["fired"] = []
+            save_state(state)
 
 
 GREEN = "\x1b[38;2;102;187;106m"
@@ -477,8 +654,47 @@ RESET = "\x1b[0m"
 SHOW_CURSOR = "\x1b[?25h"
 
 
+def _read_codepoint(fd):
+    """Read one full UTF-8 codepoint from fd. Returns "" on EOF / invalid lead."""
+    try:
+        b = os.read(fd, 1)
+    except OSError as e:
+        if e.errno == errno.EINTR:
+            return ""
+        raise
+    if not b:
+        return ""
+    first = b[0]
+    if first < 0x80:
+        nbytes = 1
+    elif first < 0xC0:
+        return ""  # stray continuation byte
+    elif first < 0xE0:
+        nbytes = 2
+    elif first < 0xF0:
+        nbytes = 3
+    elif first < 0xF8:
+        nbytes = 4
+    else:
+        return ""
+    while len(b) < nbytes:
+        try:
+            more = os.read(fd, nbytes - len(b))
+        except OSError as e:
+            if e.errno == errno.EINTR:
+                continue
+            return ""
+        if not more:
+            break
+        b += more
+    return b.decode("utf-8", "ignore")
+
+
 def _play_postpone_phrase(phrase, minutes):
-    fd = sys.stdin.fileno()
+    try:
+        fd = sys.stdin.fileno()
+    except (ValueError, OSError):
+        return False
     try:
         old = termios.tcgetattr(fd)
     except termios.error:
@@ -545,12 +761,17 @@ def _play_postpone_phrase(phrase, minutes):
         park_cursor(pos)
         sys.stdout.flush()
         while pos < len(phrase):
-            ch = os.read(fd, 1).decode("utf-8", "ignore")
+            ch = _read_codepoint(fd)
             if ch in ("\x03", "\x04", "\x1b"):
                 return False
+            if not ch:
+                continue
             if select.select([fd], [], [], 0.030)[0]:
                 while select.select([fd], [], [], 0.030)[0]:
-                    os.read(fd, 4096)
+                    try:
+                        os.read(fd, 4096)
+                    except OSError:
+                        break
                 errors += 1
                 sys.stdout.write("\x07")
                 sys.stdout.write(render(pos, errors).replace(DIM, RED))
@@ -578,7 +799,9 @@ def _play_postpone_phrase(phrase, minutes):
 
 
 def cmd_status():
-    config = load_config()
+    config, err = load_config()
+    if err is not None:
+        sys.exit(err)
     if config is None:
         sys.exit("no config — run: just-go-home init")
     now = datetime.now()
@@ -637,8 +860,11 @@ STYLE_SNIPPET = """
 
 def cmd_init():
     if not CONFIG_FILE.exists():
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(EXAMPLE_CONFIG)
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(EXAMPLE_CONFIG)
+        except OSError as e:
+            sys.exit(f"could not write config: {e}")
         print(f"wrote example config: {CONFIG_FILE}")
     else:
         print(f"config exists: {CONFIG_FILE}")
@@ -675,4 +901,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)
