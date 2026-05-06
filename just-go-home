@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""just-go-home — end-of-workday enforcer for Omarchy/waybar."""
+
+import argparse
+import json
+import os
+import random
+import subprocess
+import sys
+import select
+import termios
+import time as _time
+import tomllib
+import traceback
+import tty
+from datetime import datetime, time, timedelta
+from pathlib import Path
+
+CONFIG_DIR = (
+    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "just-go-home"
+)
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+CACHE_DIR = (
+    Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "just-go-home"
+)
+STATE_FILE = CACHE_DIR / "state.json"
+
+DAY_MAP = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+NOTIFY_OFFSETS = [3600, 1800, 900, 300, 60, 30]
+POSTPONE_LOCK_SECS = 90
+DRY_RUN = os.environ.get("JGH_DRY_RUN") == "1"
+
+
+def load_config():
+    if not CONFIG_FILE.exists():
+        return None
+    with open(CONFIG_FILE, "rb") as f:
+        return tomllib.load(f)
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_state(state):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_FILE)
+
+
+def next_scheduled(config, now):
+    candidates = []
+    for spec in config.get("targets", []):
+        days = [DAY_MAP[d.lower()] for d in spec["days"]]
+        h, m = map(int, spec["time"].split(":"))
+        for offset in range(0, 8):
+            d = (now + timedelta(days=offset)).date()
+            if d.weekday() in days:
+                cand = datetime.combine(d, time(h, m))
+                if cand > now:
+                    candidates.append(cand)
+                    break
+    return min(candidates) if candidates else None
+
+
+def get_target(config, state, now):
+    override = state.get("target_override")
+    if override:
+        try:
+            ov = datetime.fromisoformat(override)
+            if ov > now or state.get("preview"):
+                return ov
+        except ValueError:
+            pass
+    return next_scheduled(config, now)
+
+
+def reconcile(state, target):
+    key = target.isoformat() if target else None
+    if state.get("target_key") != key:
+        state["target_key"] = key
+        state["fired"] = []
+        state["last_eta"] = None
+        state["last_tick"] = None
+        state["final_notif_at"] = None
+    state.setdefault("fired", [])
+    return state
+
+
+def classify(eta):
+    if eta <= 0:
+        return "shutdown"
+    if eta <= 60:
+        return "flashing"
+    if eta <= 300:
+        return "urgent"
+    if eta <= 1800:
+        return "warning"
+    if eta <= 3600:
+        return "warm"
+    return "calm"
+
+
+def eta_part(eta):
+    """Return (n, unit_word) for the largest natural unit, ceiling-rounded."""
+    if eta >= 3600:
+        n = -(-eta // 3600)
+        return n, "hour" if n == 1 else "hours"
+    if eta >= 60:
+        n = -(-eta // 60)
+        return n, "minute" if n == 1 else "minutes"
+    return eta, "second" if eta == 1 else "seconds"
+
+
+def fmt_eta_pango(eta):
+    if eta <= 0:
+        return "<span weight='heavy' size='medium'>GO HOME</span>"
+    n, word = eta_part(eta)
+    return (
+        f"<span weight='heavy' size='medium'>Shutdown</span>"
+        f"<span weight='ultralight' size='medium'> in </span>"
+        f"<span weight='heavy' size='medium'>{n}</span>"
+        f"<span weight='ultralight' size='medium'> {word}</span>"
+    )
+
+
+def fmt_eta_plain(eta):
+    if eta <= 0:
+        return "GO HOME"
+    n, word = eta_part(eta)
+    return f"{n} {word}"
+
+
+DEFAULT_CALM_MESSAGES = [
+    "Be the BEST PART of her day.",
+    "Make them feel CHOSEN tonight.",
+    "Be the dad who ALWAYS comes home.",
+    "Your kids will remember you SHOWED UP.",
+    "Tonight — be FULLY there.",
+    "She fell for the man who knew when to STOP.",
+    "Make her LAUGH before bedtime.",
+    "Their joy is your REAL job.",
+    "Be PRESENT — not just home.",
+    "They need YOU, not your leftovers.",
+    "Be the reason she SMILES at the door.",
+    "Your kids are watching WHAT you CHOOSE.",
+    "Choose THEM. Every time.",
+    "Show up BEFORE they stop expecting you.",
+    "Give her the BEST of you — not the rest.",
+]
+DEFAULT_URGENT_MESSAGES = [
+    "Save it. Close it. LEAVE.",
+    "STAND UP. Walk away.",
+    "HANDS OFF the keyboard.",
+    "SHUT the lid.",
+    "STOP. Go home.",
+    "Drop everything. LEAVE NOW.",
+    "Go. NOW!",
+]
+
+
+def fmt_remaining(secs):
+    if secs >= 60:
+        m = secs // 60
+        return (m, "minute" if m == 1 else "minutes")
+    return (secs, "second" if secs == 1 else "seconds")
+
+
+BAR_COLORS = [
+    "#d4e157", "#dde260", "#e6e466", "#efe568",
+    "#f5db5a", "#fac84f", "#ffb348", "#ff9b3d",
+    "#ff8333", "#ff6b2d", "#fb541f", "#f6411a",
+    "#ef2918", "#e60d10", "#ff0000",
+]
+URGENT_THRESHOLDS = [60, 30, 0]
+MAIN_LEN = len(BAR_COLORS) - len(URGENT_THRESHOLDS)
+
+
+def progress_bar(secs):
+    if secs > 3600:
+        filled = 0
+    elif secs <= 300:
+        filled = MAIN_LEN
+    else:
+        frac = (3600 - secs) / (3600 - 300)
+        filled = round(1 + frac * (MAIN_LEN - 1))
+    out = []
+    for i in range(MAIN_LEN):
+        ch = "▬" if i < filled else "▭"
+        out.append(f"<span foreground='{BAR_COLORS[i]}'>{ch}</span>")
+    for j, t in enumerate(URGENT_THRESHOLDS):
+        ch = "▬" if secs <= t else "▭"
+        out.append(f"<span foreground='{BAR_COLORS[MAIN_LEN + j]}'>{ch}</span>")
+    return "".join(out)
+
+
+def shutdown_line(num_html, unit):
+    return (
+        f"<span font='Monospace 8'><b>Shutdown</b>"
+        f"<span weight='ultralight'> in </span>"
+        f"{num_html}"
+        f"<span weight='ultralight'> {unit}</span></span>"
+    )
+
+
+def build_body(top_html, secs, suffix=""):
+    bar = progress_bar(secs)
+    return (
+        f"<span size='xx-small'>\n</span>"
+        f"{top_html}\n"
+        f"<span font='Monospace 14'>{bar}</span>{suffix}"
+    )
+
+
+def send_notification(state, urgency, timeout_ms, summary, body):
+    args = [
+        "notify-send",
+        "-u",
+        urgency,
+        "-a",
+        "just-go-home",
+        "-i",
+        "alarm-symbolic",
+        "-t",
+        str(timeout_ms),
+        "-p",
+    ]
+    if state is not None and state.get("notif_id"):
+        prev = str(state["notif_id"])
+        subprocess.run(
+            ["makoctl", "dismiss", "-n", prev],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        args += ["-r", prev]
+    args += [summary, body]
+    res = subprocess.run(args, check=False, capture_output=True, text=True)
+    if state is not None:
+        nid = res.stdout.strip()
+        if nid.isdigit():
+            state["notif_id"] = int(nid)
+
+
+def fire_notification(secs, config, state=None):
+    calm = config.get("notification_messages") or DEFAULT_CALM_MESSAGES
+    urgent = config.get("urgent_notification_messages") or DEFAULT_URGENT_MESSAGES
+    pool = urgent if secs <= 60 else calm
+    recent = (state or {}).get("recent_msgs", [])
+    available = [m for m in pool if m not in recent] or pool
+    msg = random.choice(available)
+    if state is not None:
+        state["recent_msgs"] = (recent + [msg])[-max(1, len(pool) // 2):]
+    n, unit = fmt_remaining(secs)
+    body = build_body(shutdown_line(f"<b>{n}</b>", unit), secs)
+    urgency = "critical" if secs <= 60 else "normal"
+    send_notification(state, urgency, 60000, msg, body)
+
+
+def maybe_notify(eta, state, now, config):
+    last_tick = state.get("last_tick")
+    last_eta = state.get("last_eta")
+    state["last_tick"] = now.isoformat()
+    state["last_eta"] = eta
+    fresh = True
+    if last_tick is not None:
+        try:
+            fresh = (now - datetime.fromisoformat(last_tick)).total_seconds() > 5
+        except ValueError:
+            fresh = True
+    if fresh:
+        state["fired"] = sorted([str(o) for o in NOTIFY_OFFSETS if eta <= o], key=int)
+        return
+    fired = set(state.get("fired", []))
+    for o in NOTIFY_OFFSETS:
+        if last_eta is not None and last_eta > o and eta <= o and str(o) not in fired:
+            fired.add(str(o))
+            state["fired"] = sorted(fired, key=int)
+            save_state(state)
+            fire_notification(o, config, state)
+    state["fired"] = sorted(fired, key=int)
+
+
+def fire_final_notification(state):
+    top = (
+        f"<span font='Monospace 8'><b>Shutting down</b>"
+        f"<span weight='ultralight'> NOW!</span></span>"
+    )
+    send_notification(
+        state,
+        "critical",
+        15000,
+        "TIME IS UP!",
+        build_body(top, 0),
+    )
+
+
+def trigger_shutdown():
+    if DRY_RUN:
+        sys.stderr.write("JGH_DRY_RUN: would run systemctl poweroff\n")
+        return
+    subprocess.run(["systemctl", "poweroff"], check=False)
+
+
+def in_postpone_window(state, now):
+    until = state.get("postpone_lock_until")
+    if not until:
+        return False
+    try:
+        return datetime.fromisoformat(until) > now
+    except ValueError:
+        return False
+
+
+def cmd_tick(loop=False):
+    if not loop:
+        _emit_tick()
+        return
+    while True:
+        try:
+            _emit_tick()
+        except Exception:
+            sys.stderr.write(traceback.format_exc())
+            sys.stderr.flush()
+        _time.sleep(1)
+
+
+def _emit_tick():
+    config = load_config()
+    if config is None:
+        print(
+            json.dumps(
+                {
+                    "text": "no config",
+                    "class": "error",
+                    "tooltip": "run: just-go-home init",
+                }
+            ),
+            flush=True,
+        )
+        return
+    now = datetime.now()
+    state = load_state()
+    target = get_target(config, state, now)
+    state = reconcile(state, target)
+
+    if target is None:
+        save_state(state)
+        print(
+            json.dumps(
+                {
+                    "text": "—",
+                    "class": "idle",
+                    "tooltip": "no upcoming target",
+                }
+            ),
+            flush=True,
+        )
+        return
+
+    eta = int((target - now).total_seconds())
+
+    if eta <= 0:
+        if in_postpone_window(state, now):
+            save_state(state)
+            print(
+                json.dumps(
+                    {
+                        "text": "PAUSED",
+                        "class": "paused",
+                        "tooltip": "override in progress",
+                    }
+                )
+            )
+            return
+        print(
+            json.dumps(
+                {
+                    "text": "SHUTTING DOWN NOW!",
+                    "class": "shutdown",
+                    "tooltip": "shutting down",
+                }
+            ),
+            flush=True,
+        )
+        if not state.get("final_notif_at"):
+            state["final_notif_at"] = now.isoformat()
+            save_state(state)
+            if not state.get("skip_final_notif"):
+                fire_final_notification(state)
+        save_state(state)
+        try:
+            elapsed = (
+                now - datetime.fromisoformat(state["final_notif_at"])
+            ).total_seconds()
+        except ValueError:
+            elapsed = 999
+        if elapsed >= 10 and not state.get("preview"):
+            trigger_shutdown()
+        return
+
+    cls = classify(eta)
+    print(
+        json.dumps(
+            {
+                "text": fmt_eta_pango(eta),
+                "class": cls,
+                "tooltip": f"target: {target.strftime('%a %H:%M')}",
+            }
+        ),
+        flush=True,
+    )
+    maybe_notify(eta, state, now, config)
+    save_state(state)
+
+
+def cmd_postpone():
+    config = load_config()
+    if config is None:
+        sys.exit("no config — run: just-go-home init")
+    state = load_state()
+    now = datetime.now()
+    target = get_target(config, state, now)
+    if target is None:
+        sys.exit("no active target to postpone")
+    phrases = config.get("phrases", [])
+    if not phrases:
+        subprocess.run(
+            ["notify-send", "-u", "critical", "-a", "just-go-home",
+             "-i", "alarm-symbolic",
+             "No override phrases configured",
+             "Add a <tt>phrases</tt> array to <tt>config.toml</tt> to enable postpone."],
+            check=False,
+        )
+        sys.exit("no phrases configured — refusing override")
+
+    state["postpone_lock_until"] = (
+        now + timedelta(seconds=POSTPONE_LOCK_SECS)
+    ).isoformat()
+    save_state(state)
+
+    try:
+        phrase = random.choice(phrases)
+        minutes = int(config.get("postpone_minutes", 15))
+        ok = _play_postpone_phrase(phrase, minutes)
+        if not ok:
+            print("\n  override cancelled. good.\n")
+            return
+        new_target = target + timedelta(minutes=minutes)
+        state["target_override"] = new_target.isoformat()
+        state["target_key"] = new_target.isoformat()
+        state["fired"] = []
+        print(
+            f"\n  \x1b[32m✓\x1b[0m postponed by \x1b[1m{minutes}m\x1b[0m"
+            f" — new target \x1b[1m{new_target.strftime('%H:%M')}\x1b[0m\n"
+        )
+        _time.sleep(2)
+    finally:
+        state["postpone_lock_until"] = None
+        save_state(state)
+
+
+GREEN = "\x1b[38;2;102;187;106m"
+DIM = "\x1b[38;2;160;160;170m"
+RED = "\x1b[38;2;255;80;80m"
+YELLOW = "\x1b[38;2;255;213;79m"
+BOLD = "\x1b[1m"
+RESET = "\x1b[0m"
+SHOW_CURSOR = "\x1b[?25h"
+
+
+def _play_postpone_phrase(phrase, minutes):
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except termios.error:
+        try:
+            typed = input(f"\n  type to postpone:\n  {phrase}\n> ")
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return typed.strip() == phrase.strip()
+
+    words = phrase.split(" ")
+    total_words = len(words)
+
+    def render(pos, errors, shake=0):
+        typed = phrase[:pos]
+        words_done = typed.count(" ") if pos > 0 else 0
+        # current word being revealed = up to and including the one being typed
+        cur_idx = words_done
+        offset = " " * shake
+        parts = []
+        for i, w in enumerate(words):
+            if i < cur_idx:
+                parts.append(f"{GREEN}{w}{RESET}")
+            elif i == cur_idx:
+                # split into typed-so-far in current word and remaining (revealed)
+                start_of_word = sum(len(x) for x in words[:i]) + i  # account for spaces
+                ch_in = pos - start_of_word
+                done = w[:ch_in]
+                rest = w[ch_in:]
+                parts.append(f"{BOLD}{GREEN}{done}{RESET}{DIM}{rest}{RESET}")
+            else:
+                parts.append(f"{DIM}{'·' * len(w)}{RESET}")
+        progress = f"{cur_idx}/{total_words}"
+        return (
+            f"\r\x1b[2K{offset}      " + "  ".join(parts) +
+            f"\r\n\x1b[2K\r\n\x1b[2K      {DIM}word {progress} · errors {errors}{RESET}"
+        )
+
+    sys.stdout.write(SHOW_CURSOR)
+    sys.stdout.write("\n\n\n")
+    sys.stdout.write(f"      {YELLOW}{BOLD}Just Go HOME!{RESET}\n\n")
+    sys.stdout.write(
+        f"      {DIM}If you really {BOLD}MUST{RESET}{DIM} postphone:"
+        f" type the phrase to earn {BOLD}{minutes}{RESET}{DIM} more minutes"
+        f" — esc to cancel{RESET}\n\n\n"
+    )
+    sys.stdout.flush()
+    def cursor_col(pos):
+        col = 6
+        words_done = phrase[:pos].count(" ")
+        for k in range(words_done):
+            col += len(words[k]) + 2
+        start = sum(len(w) for w in words[:words_done]) + words_done
+        col += pos - start
+        return col
+
+    def park_cursor(pos):
+        sys.stdout.write(f"\x1b[2A\r\x1b[{cursor_col(pos)}C")
+
+    try:
+        tty.setraw(fd)
+        pos = 0
+        errors = 0
+        sys.stdout.write(render(pos, errors))
+        park_cursor(pos)
+        sys.stdout.flush()
+        while pos < len(phrase):
+            ch = os.read(fd, 1).decode("utf-8", "ignore")
+            if ch in ("\x03", "\x04", "\x1b"):
+                return False
+            if select.select([fd], [], [], 0.030)[0]:
+                while select.select([fd], [], [], 0.030)[0]:
+                    os.read(fd, 4096)
+                errors += 1
+                sys.stdout.write("\x07")
+                sys.stdout.write(render(pos, errors).replace(DIM, RED))
+                park_cursor(pos)
+                sys.stdout.flush()
+                _time.sleep(0.4)
+                continue
+            if ch == phrase[pos]:
+                pos += 1
+            else:
+                errors += 1
+                sys.stdout.write("\x07")  # bell
+                sys.stdout.write(render(pos, errors).replace(DIM, RED))
+                park_cursor(pos)
+                sys.stdout.flush()
+                _time.sleep(0.12)
+            sys.stdout.write(render(pos, errors))
+            park_cursor(pos)
+            sys.stdout.flush()
+        return True
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write(SHOW_CURSOR + "\n")
+        sys.stdout.flush()
+
+
+def cmd_status():
+    config = load_config()
+    if config is None:
+        sys.exit("no config — run: just-go-home init")
+    now = datetime.now()
+    state = load_state()
+    target = get_target(config, state, now)
+    if target is None:
+        print("no upcoming target")
+        return
+    eta = int((target - now).total_seconds())
+    print(f"target: {target.isoformat()}")
+    print(f"eta:    {fmt_eta_plain(eta)}")
+    if state.get("target_override"):
+        print("(postponed)")
+
+
+EXAMPLE_CONFIG = """# just-go-home config
+
+postpone_minutes = 15
+
+# typed verbatim during the postpone challenge
+phrases = [
+  "my children will not be small forever",
+  "my wife deserves the best of me, not the rest",
+  "the work will still be here tomorrow",
+]
+
+[[targets]]
+days = ["mon", "tue", "wed", "thu", "fri"]
+time = "17:00"
+"""
+
+WAYBAR_SNIPPET = """
+"custom/just-go-home": {
+  "exec": "just-go-home tick --loop",
+  "return-type": "json",
+  "on-click": "setsid uwsm-app -- xdg-terminal-exec --title=just-go-home -e just-go-home postpone"
+}
+"""
+
+STYLE_SNIPPET = """
+#custom-just-go-home          { padding: 1px 7px; margin: 0 0 0 6px; border-radius: 6px; min-width: 130px; }
+#custom-just-go-home.calm     { color: #9aa0a6; }
+#custom-just-go-home.warm     { color: #efe568; }
+#custom-just-go-home.warning  { color: #ff9b3d; }
+#custom-just-go-home.urgent   { color: #ff6b2d; }
+#custom-just-go-home.flashing { color: #ffffff; background-color: #ff0000; animation: jgh-flash 0.7s steps(2) infinite; }
+#custom-just-go-home.shutdown { color: #ffffff; background-color: #ff0000; }
+#custom-just-go-home.paused   { color: #2e3440; background-color: #ebcb8b; }
+#custom-just-go-home.idle     { color: #4c566a; }
+@keyframes jgh-flash {
+  0%   { color: #ffffff; background-color: #bf0000; }
+  100% { color: #bf0000; background-color: #ffffff; }
+}
+"""
+
+
+def cmd_init():
+    if not CONFIG_FILE.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(EXAMPLE_CONFIG)
+        print(f"wrote example config: {CONFIG_FILE}")
+    else:
+        print(f"config exists: {CONFIG_FILE}")
+    print()
+    print("add to ~/.config/waybar/config.jsonc (inside the modules object):")
+    print(WAYBAR_SNIPPET)
+    print("add to ~/.config/waybar/style.css:")
+    print(STYLE_SNIPPET)
+    print(
+        'then add "custom/just-go-home" to your modules-right (or -left/-center) array,'
+    )
+    print("and restart waybar.")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="just-go-home", description="end-of-workday enforcer"
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+    tick_p = sub.add_parser("tick", help="emit one waybar JSON line")
+    tick_p.add_argument("--loop", action="store_true", help="stream JSON every second")
+    sub.add_parser("postpone", help="run rotating-phrase override")
+    sub.add_parser("status", help="print current target and eta")
+    sub.add_parser("init", help="create example config and print waybar snippet")
+    args = p.parse_args()
+    if args.cmd == "tick":
+        cmd_tick(loop=args.loop)
+    elif args.cmd == "postpone":
+        cmd_postpone()
+    elif args.cmd == "status":
+        cmd_status()
+    elif args.cmd == "init":
+        cmd_init()
+
+
+if __name__ == "__main__":
+    main()
