@@ -9,7 +9,8 @@ flashing → shutdown. Notifications follow the same arc:
 
 ### Mako Notifications
 
-![calm](screenshots/notification-calm.png) ![urgent](screenshots/notification-urgent.png) ![shutdown](screenshots/notification-shutdown.png)
+| ![calm](screenshots/notification-calm.png) | ![urgent](screenshots/notification-urgent.png) | ![shutdown](screenshots/notification-shutdown.png) |
+|---|---|---|
 
 ### Waybar Widget (escalation)
 
